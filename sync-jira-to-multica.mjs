@@ -60,6 +60,15 @@
  *   in the workspace when missing. Turning the flag off later does not remove labels.
  *   Needs a Jira site that uses sprints (Scrum board).
  *
+ * --attachments: upload every file attached to the Jira issue (images, PDFs, archives...)
+ *   to the Multica issue. Files are downloaded from Jira and uploaded to Multica
+ *   (limit 100 MiB per file, bigger files are skipped). Uploaded Jira attachment ids are
+ *   stored in the state file, so each file is uploaded once. Images and files shown in
+ *   the description or in comments are linked when their name in Jira matches the
+ *   attachment file name. Others show as "[attachment: name]". Run with --refresh-comments
+ *   as well to fix comments that were pushed earlier.
+ *   The files are stored in Multica, so make sure that is allowed for your data.
+ *
  * Never commit tokens or the state file.
  */
 import { createHash } from 'node:crypto';
@@ -77,6 +86,7 @@ if (Number.isNaN(LIMIT) || LIMIT < 1) {
 const SPRINT_LABELS = args.includes('--sprint-labels');
 const REFRESH_COMMENTS = args.includes('--refresh-comments');
 const COMMENTS = args.includes('--comments') || REFRESH_COMMENTS;
+const ATTACHMENTS = args.includes('--attachments');
 
 // --issue KEY[,KEY...] (repeatable): sync only these Jira issues. Overrides JIRA_PROJECT_KEY and JIRA_JQL.
 const ISSUE_KEYS = args
@@ -229,6 +239,7 @@ async function* searchJira() {
         'status',
         'priority',
         'duedate',
+        ...(ATTACHMENTS ? ['attachment'] : []),
         ...(sprintFieldId ? [sprintFieldId] : []),
       ],
       ...(nextPageToken ? { nextPageToken } : {}),
@@ -249,6 +260,34 @@ async function* searchJira() {
     yield* data.issues;
     nextPageToken = data.nextPageToken;
   } while (nextPageToken);
+}
+
+// Attachments already uploaded to Multica for the current issue, by file name.
+// Filled by setMediaContext() so that adfToText() can link images and files.
+let mediaIndex = new Map();
+
+function setMediaContext(entry) {
+  mediaIndex = new Map(
+    Object.values(entry?.attachments || {}).map((attachment) => [
+      attachment.filename,
+      attachment,
+    ]),
+  );
+}
+
+// ADF "media" nodes: pasted images carry the file name in attrs.alt.
+// Files in a media group often carry no name, so they can only show as a placeholder.
+function renderMedia(node) {
+  const alt = (node.attrs?.alt || '').replace(/[[\]\r\n]/g, ' ').trim();
+  if (node.attrs?.type === 'external' && node.attrs.url) {
+    return `![${alt}](${node.attrs.url})`;
+  }
+  const found = alt ? mediaIndex.get(alt) : undefined;
+  if (!found) return `[attachment: ${alt || 'file'}]`;
+  if ((found.contentType || '').startsWith('image/')) {
+    return `![${alt}](${found.markdownUrl || found.url})`;
+  }
+  return `[${found.filename}](${found.downloadUrl || found.url})`;
 }
 
 // Minimal Atlassian Document Format -> plain text.
@@ -274,6 +313,12 @@ function adfToText(node) {
     case 'blockCard':
     case 'embedCard':
       return node.attrs?.url ? `${node.attrs.url}\n\n` : '';
+    case 'media':
+      return renderMedia(node);
+    case 'mediaSingle':
+      return `${inner}\n\n`;
+    case 'mediaGroup':
+      return `${inner}\n`;
     case 'mention':
       return node.attrs?.text || '';
     case 'listItem':
@@ -520,6 +565,90 @@ async function syncComments(issueKey, state) {
   return touched + fresh.length;
 }
 
+// Attachment support (only used with --attachments).
+const MAX_UPLOAD_BYTES = 100 * 1024 * 1024; // Multica rejects files above 100 MiB.
+
+async function downloadJiraAttachment(attachment) {
+  // Never send the Jira credentials to another host.
+  if (!String(attachment.content || '').startsWith(`${jiraBase}/`)) {
+    throw new Error('Attachment URL is not on the Jira site');
+  }
+  // Jira answers with a redirect to its media host. fetch drops the Authorization header
+  // when a redirect goes to another origin, so the credentials stay on the Jira site.
+  const response = await fetch(attachment.content, {
+    headers: { Authorization: `Basic ${jiraAuth}` },
+  });
+  if (!response.ok) {
+    throw new Error(`Jira attachment download failed with HTTP ${response.status}`);
+  }
+  return Buffer.from(await response.arrayBuffer());
+}
+
+async function uploadAttachment(issueId, attachment, buffer) {
+  const form = new FormData();
+  form.append('issue_id', issueId);
+  form.append(
+    'file',
+    new Blob([buffer], { type: attachment.mimeType || 'application/octet-stream' }),
+    attachment.filename,
+  );
+  // Let fetch set the multipart Content-Type with its boundary.
+  const headers = { ...multicaHeaders };
+  delete headers['Content-Type'];
+  return http(
+    `${multicaBase}/api/upload-file`,
+    { method: 'POST', headers, body: form },
+    'Multica upload file',
+  );
+}
+
+// Uploads Jira attachments that were not uploaded before. Returns how many were uploaded
+// (or would be, on a dry run).
+async function syncAttachments(issue, state) {
+  const entry = state.issues[issue.key];
+  const done = entry?.attachments || {};
+  const fresh = (issue.fields.attachment || []).filter(
+    (attachment) => !done[attachment.id],
+  );
+  if (fresh.length === 0) return 0;
+  const totalMb = (
+    fresh.reduce((sum, attachment) => sum + (attachment.size || 0), 0) / 1048576
+  ).toFixed(1);
+  console.log(`attach  ${issue.key}  +${fresh.length} (${totalMb} MB)`);
+  if (!APPLY || !entry) return fresh.length;
+
+  let uploaded = 0;
+  for (const attachment of fresh) {
+    if ((attachment.size || 0) > MAX_UPLOAD_BYTES) {
+      console.warn(`skip    ${issue.key}: ${attachment.filename} is larger than 100 MiB`);
+      continue;
+    }
+    try {
+      const buffer = await downloadJiraAttachment(attachment);
+      const result = await uploadAttachment(entry.multicaId, attachment, buffer);
+      if (!result?.id) throw new Error('Multica returned no attachment id');
+      entry.attachments = {
+        ...(entry.attachments || {}),
+        [attachment.id]: {
+          multicaId: result.id,
+          filename: attachment.filename,
+          contentType: attachment.mimeType || '',
+          url: result.url || '',
+          downloadUrl: result.download_url || '',
+          markdownUrl: result.markdown_url || '',
+        },
+      };
+      await saveState(state);
+      uploaded += 1;
+    } catch (error) {
+      // Keep going: the file is retried on the next run because it is not in the state file.
+      console.error(`failed  ${issue.key}: attachment ${attachment.filename}: ${error.message}`);
+      process.exitCode = 1;
+    }
+  }
+  return uploaded;
+}
+
 async function loadState() {
   try {
     return JSON.parse(await readFile(statePath, 'utf8'));
@@ -539,7 +668,14 @@ const hashOf = (payload) =>
 
 async function main() {
   const state = await loadState();
-  const counts = { created: 0, updated: 0, unchanged: 0, comments: 0, failed: 0 };
+  const counts = {
+    created: 0,
+    updated: 0,
+    unchanged: 0,
+    comments: 0,
+    attachments: 0,
+    failed: 0,
+  };
   let seen = 0;
 
   console.log(`${APPLY ? 'APPLY' : 'DRY RUN'} | JQL: ${jql}`);
@@ -551,6 +687,8 @@ async function main() {
     if (seen >= LIMIT) break;
     seen += 1;
 
+    // Link files that were uploaded in earlier runs (empty when --attachments is off).
+    setMediaContext(state.issues[issue.key]);
     const payload = toMulticaPayload(issue);
     const sprintName = SPRINT_LABELS ? pickSprintName(issue) : '';
     const hash = hashOf(SPRINT_LABELS ? { ...payload, sprint: sprintName } : payload);
@@ -591,7 +729,29 @@ async function main() {
         counts.unchanged += 1;
       }
 
+      if (ATTACHMENTS) {
+        const uploaded = await syncAttachments(issue, state);
+        counts.attachments += uploaded;
+        // The description may link files that were uploaded just now. Rebuild it and
+        // update the issue when it changed.
+        const entry = state.issues[issue.key];
+        if (APPLY && entry && uploaded > 0) {
+          setMediaContext(entry);
+          const finalPayload = toMulticaPayload(issue);
+          const finalHash = hashOf(
+            SPRINT_LABELS ? { ...finalPayload, sprint: sprintName } : finalPayload,
+          );
+          if (finalHash !== entry.hash) {
+            await updateIssue(entry.multicaId, finalPayload);
+            entry.hash = finalHash;
+            await saveState(state);
+          }
+        }
+      }
+
       if (COMMENTS) {
+        // Comments may link files too, so use the latest uploaded set.
+        setMediaContext(state.issues[issue.key]);
         counts.comments += await syncComments(issue.key, state);
       }
     } catch (error) {

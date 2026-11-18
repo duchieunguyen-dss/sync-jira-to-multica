@@ -16,8 +16,9 @@ File chính: `sync-jira-to-multica.mjs` (Node, không cần cài thư viện).
 | Project (Multica) | Nếu đặt `MULTICA_PROJECT_ID` |
 | Sprint | Chỉ khi dùng `--sprint-labels`, dưới dạng label |
 | Comment | Chỉ khi dùng `--comments` |
+| Ảnh và file đính kèm | Chỉ khi dùng `--attachments` |
 
-**Không đồng bộ:** assignee, label của Jira, Epic và sub-task (quan hệ cha con), issue link, ảnh và file đính kèm, định dạng đậm/nghiêng/bảng, thứ tự rank của backlog.
+**Không đồng bộ:** assignee, label của Jira, Epic và sub-task (quan hệ cha con), issue link, định dạng đậm/nghiêng/bảng, thứ tự rank của backlog.
 
 ## Yêu cầu
 
@@ -80,6 +81,7 @@ node sync-jira-to-multica.mjs --apply
 | `--sprint-labels` | Gắn label tên sprint (hoặc `Backlog` nếu không có sprint). Tự tạo label nếu chưa có |
 | `--comments` | Thêm comment mới từ Jira sang Multica |
 | `--refresh-comments` | Ghi lại cả comment đã đẩy trước đó theo cách chuyển đổi hiện tại. Bao gồm `--comments` |
+| `--attachments` | Tải mọi file đính kèm từ Jira và upload sang issue trên Multica (ảnh, PDF, zip...). Mỗi file chỉ upload một lần |
 
 Ví dụ:
 ```bash
@@ -110,7 +112,13 @@ Script **không tự chạy định kỳ**. Muốn tự động cần đặt l�
   - Sửa hoặc xóa comment bên Jira thì Multica không đổi (trừ khi dùng `--refresh-comments` để ghi lại bản sửa).
   - Nội dung quá 20000 ký tự bị cắt.
 - **Sprint label.** Mỗi issue chỉ có một label sprint: sprint `active` ưu tiên, rồi `future`, rồi sprint cuối cùng. Tên label cắt còn 32 ký tự. Tắt `--sprint-labels` về sau không gỡ label đã gắn. Chỉ dùng khi site Jira có sprint.
-- **Dữ liệu ticket (kể cả tên người comment) được gửi sang Multica.** Hãy chắc chắn nội dung phù hợp để đưa lên đó.
+- **File đính kèm (`--attachments`).**
+  - Script tải file từ Jira bằng thông tin xác thực Jira, rồi upload sang Multica (mỗi file tối đa 100 MiB, file lớn hơn bị bỏ qua và in cảnh báo). Việc này làm chạy lâu hơn.
+  - Ảnh hoặc file trong description và comment được nối với file đã upload **theo tên file**. Ảnh dán vào Jira thường có tên trùng, nhưng file trong nhóm đính kèm có thể không có tên, khi đó hiện `[attachment: ...]`. File vẫn nằm trong danh sách đính kèm của issue.
+  - Hai ảnh trùng tên trong cùng một issue có thể bị nối nhầm.
+  - Comment đã đẩy trước đó chỉ có ảnh sau khi chạy lại với `--refresh-comments --attachments`.
+  - Nếu một file lỗi, script in cảnh báo, bỏ qua file đó và thử lại ở lần chạy sau.
+- **Dữ liệu ticket (kể cả tên người comment, ảnh và file đính kèm) được gửi sang Multica.** Hãy chắc chắn nội dung phù hợp để đưa lên đó.
 
 ## Bảo mật
 
@@ -133,6 +141,8 @@ Script **không tự chạy định kỳ**. Muốn tự động cần đặt l�
 | `Multica ... failed with HTTP 404` | Slug sai, hoặc tài khoản không thuộc workspace |
 | `No Sprint field found in Jira` | Site Jira không dùng sprint. Bỏ `--sprint-labels` |
 | Kết quả toàn `0` với `--issue` | Key không tồn tại hoặc không có quyền xem |
+| `attachment ...: Jira attachment download failed with HTTP ...` | Không có quyền tải file trên Jira, hoặc link file hết hạn. Thử lại lần sau |
+| `attachment ...: Multica upload file failed with HTTP 413` | File vượt giới hạn upload của Multica (100 MiB) |
 | Issue bị tạo trùng | File state bị mất hoặc đổi workspace. Kiểm tra `MULTICA_SYNC_STATE` |
 
 Kiểm tra token Multica riêng, không qua script (chỉ in mã HTTP, kết quả đúng là `200`):
